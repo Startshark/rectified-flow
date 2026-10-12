@@ -1,10 +1,14 @@
 base_channels: 64  # base_channels大一些有好处
 epochs: 50 # 训练多少个epoch
-batch_size: 16  # batch_size小一些
+batch_size: 64  # batch_size（推荐64或128，训练速度更快且稳定）
 lr_adjust_epoch: 25 # 学习率调整的epoch，降为原有的10%
 batch_print_interval: 100 # 打印间隔，以batch为单位
-checkpoint_save_interval: 10 # 模型保存间隔，以epoch为单位
-save_path: './checkpoints/v1.1-cfg'  # 模型保存路径
+checkpoint_save_interval: 10 # 模型保存与采样间隔，以epoch为单位
+outputs_root: './outputs'  # 输出主目录，内部自动创建带时间戳的实验文件夹
 use_cfg: True  # 是否使用classifier-free guidance，开启就可以训练条件生成模型了
 device: 'cuda' # cuda、cpu、mps(only macbook)
- 
+
+# 采样评估参数（每个checkpoint自动采样）
+sample_steps: 20 # 采样生成图片的Euler迭代步数（10~20步速度极快且效果优秀）
+sample_cfg_scale: 5.0 # CFG采样引导系数
+sample_num_per_class: 10 # 每个数字类别的采样图片数量（总计10x10=100张拼图及独立图像）

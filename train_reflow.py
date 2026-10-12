@@ -1,172 +1,315 @@
-import torch
+import argparse
+from datetime import datetime
+import json
 import os
-import yaml
-from datasets import ReflowDataset
-from torchvision.transforms import ToTensor, Compose, Normalize
-from torch.utils.data import DataLoader
-from model import MiniUnet
+import sys
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import StepLR
+from torch.utils.data import DataLoader
+from torchvision.transforms import Compose, ToTensor
+from torchvision.utils import save_image
+import yaml
+
+from datasets import ReflowDataset
+from model import MiniUnet
 from rectified_flow import RectifiedFlow
 
-# 1. reflow的训练要从上一个1-rectified flow(v1.1)模型的权重作为预训练权重
+
+class DualLogger:
+    """同时将输出打印到控制台和日志文件"""
+    def __init__(self, log_path):
+        self.terminal = sys.stdout
+        self.log_file = open(log_path, 'a', encoding='utf-8')
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log_file.write(message)
+        self.log_file.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+
+    def close(self):
+        if self.log_file and not self.log_file.closed:
+            self.log_file.close()
 
 
-def train(config: str):
-    """训练reflow模型
+def plot_and_save_loss_curve(loss_list, save_path, epoch=None):
+    """绘制并保存损失曲线，包含批次损失与平滑移动平均线"""
+    if not loss_list:
+        return
+    plt.figure(figsize=(10, 6))
+    plt.plot(loss_list, label='Batch Loss', alpha=0.45, color='dodgerblue')
 
-    Args:
-        config (str): yaml配置文件路径，包含以下参数：
-            base_channels (int, optional): MiniUnet的基础通道数，默认值为16。
-            epochs (int, optional): 训练轮数，默认值为10。
-            batch_size (int, optional): 批大小，默认值为128。
-            lr (float, optional): 学习率，默认值为1e-5。
-            lr_adjust_epoch (int, optional): 学习率调整轮数，默认值为50。
-            batch_print_interval (int, optional): batch打印信息间隔，默认值为100。
-            checkpoint_save_interval (int, optional): checkpopint保存间隔(单位为epoch)，默认值为1。
-            save_path (str, optional): 模型保存路径，默认值为'./checkpoints'。
-            use_cfg (bool, optional): 是否使用Classifier-free Guidance训练条件生成模型，默认值为False。
-            img_root_path (str, optional): reflow图像根路径，默认值为None。
-            noise_root_path (str, optional): reflow噪声根路径，默认值为None。
-            checkpoint_path (str, optional): 预训练模型路径，默认值为None。
-            device (str, optional): 训练设备，默认值为'cuda'。
+    if len(loss_list) >= 20:
+        window = min(50, max(5, len(loss_list) // 20))
+        smoothed = np.convolve(loss_list, np.ones(window) / window, mode='valid')
+        plt.plot(
+            np.arange(window - 1, len(loss_list)),
+            smoothed,
+            label=f'Moving Avg ({window})',
+            color='crimson',
+            linewidth=1.8
+        )
 
-    """
-    # 读取yaml配置文件
-    config = yaml.load(open(config, 'rb'), Loader=yaml.FullLoader)
-    # 解析参数数据，有默认值
-    base_channels = config.get('base_channels', 16)
-    epochs = config.get('epochs', 10)
-    batch_size = config.get('batch_size', 128)
-    lr_adjust_epoch = config.get('lr_adjust_epoch', 50)
-    batch_print_interval = config.get('batch_print_interval', 100)
-    checkpoint_save_interval = config.get('checkpoint_save_interval', 1)
-    save_path = config.get('save_path', './checkpoints')
-    use_cfg = config.get('use_cfg', False)
-    device = config.get('device', 'cuda')
+    plt.xlabel('Iteration')
+    plt.ylabel('Loss')
+    title = 'Reflow Training Loss Curve'
+    if epoch is not None:
+        title += f' (Epoch {epoch})'
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(save_path, bbox_inches='tight', dpi=150)
+    plt.close()
+
+
+@torch.no_grad()
+def sample_checkpoint_images(
+    model,
+    rf,
+    device,
+    save_dir,
+    epoch,
+    use_cfg=True,
+    cfg_scale=5.0,
+    step=2,
+    fixed_noise=None,
+    num_per_class=10
+):
+    """Reflow 模型采样生成实际图片并保存全景拼图与独立图片（Reflow 2步即可生成高质量图像）"""
+    model.eval()
+    if use_cfg:
+        y = torch.tensor(
+            [i for i in range(10) for _ in range(num_per_class)],
+            device=device,
+            dtype=torch.long
+        )
+        num_imgs = 10 * num_per_class
+        nrow = 10
+    else:
+        y = None
+        num_imgs = 64
+        nrow = 8
+
+    if fixed_noise is not None and fixed_noise.shape[0] == num_imgs:
+        x_t = fixed_noise.clone().to(device)
+    else:
+        x_t = torch.randn(num_imgs, 1, 28, 28, device=device)
+
+    dt = 1.0 / step
+    for j in range(step):
+        t = torch.full((num_imgs,), j * dt, device=device)
+        if use_cfg:
+            v_uncond = model(x=x_t, t=t)
+            v_cond = model(x=x_t, t=t, y=y)
+            v_pred = v_uncond + cfg_scale * (v_cond - v_uncond)
+        else:
+            v_pred = model(x=x_t, t=t)
+        x_t = rf.euler(x_t, v_pred, dt)
+
+    x_t = x_t.clamp(0, 1)
+
+    grid_file = os.path.join(save_dir, f'epoch_{epoch:03d}_grid.png')
+    save_image(x_t, grid_file, nrow=nrow)
+
+    indiv_dir = os.path.join(save_dir, f'epoch_{epoch:03d}')
+    os.makedirs(indiv_dir, exist_ok=True)
+    for idx in range(num_imgs):
+        label_str = f"_label_{y[idx].item()}" if y is not None else ""
+        save_image(x_t[idx], os.path.join(indiv_dir, f'{idx:03d}{label_str}.png'))
+
+    model.train()
+    print(f'  [Reflow Checkpoint {epoch}] 采样完成，图像已保存至: {grid_file}')
+    return grid_file
+
+
+def train(config_path: str = './config/train_reflow_config.yaml', output_dir_override: str = None):
+    """训练 reflow 模型，输出至时间戳目录"""
+    with open(config_path, 'r', encoding='utf-8') as f:
+        cfg = yaml.load(f, Loader=yaml.FullLoader)
+
+    base_channels = cfg.get('base_channels', 16)
+    epochs = cfg.get('epochs', 10)
+    batch_size = cfg.get('batch_size', 128)
+    lr_adjust_epoch = cfg.get('lr_adjust_epoch', 50)
+    batch_print_interval = cfg.get('batch_print_interval', 100)
+    checkpoint_save_interval = cfg.get('checkpoint_save_interval', 1)
+    use_cfg = cfg.get('use_cfg', False)
+    device = cfg.get('device', 'cuda')
+
+    lr = cfg.get('lr', 1e-5)
+    img_root_path = cfg.get('img_root_path', None)
+    noise_root_path = cfg.get('noise_root_path', None)
+    checkpoint_path = cfg.get('checkpoint_path', None)
+    sample_steps = cfg.get('sample_steps', 2)
+    sample_cfg_scale = cfg.get('sample_cfg_scale', 5.0)
+    sample_num_per_class = cfg.get('sample_num_per_class', 10)
+
     if device == 'cuda' and not torch.cuda.is_available():
         print('[Warning] CUDA requested but not available on this node. Falling back to cpu.')
         device = 'cpu'
 
-    # v1.2 reflow增加参数
-    lr = config.get('lr', 1e-5)
-    img_root_path = config.get('img_root_path', None)
-    noise_root_path = config.get('noise_root_path', None)
-    checkpoint_path = config.get('checkpoint_path', None)
+    if output_dir_override:
+        output_dir = output_dir_override
+    else:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        outputs_root = cfg.get('outputs_root', './outputs')
+        output_dir = os.path.join(outputs_root, f'reflow_{timestamp}')
 
-    # 打印训练参数
-    print('Training config:')
-    print(f'base_channels: {base_channels}')
-    print(f'epochs: {epochs}')
-    print(f'batch_size: {batch_size}')
-    print(f'learning rate: {lr}')
-    print(f'lr_adjust_epoch: {lr_adjust_epoch}')
-    print(f'batch_print_interval: {batch_print_interval}')
-    print(f'checkpoint_save_interval: {checkpoint_save_interval}')
-    print(f'save_path: {save_path}')
-    print(f'use_cfg: {use_cfg}')
-    print(f'img_root_path: {img_root_path}')
-    print(f'noise_root_path: {noise_root_path}')
-    print(f'checkpoint_path: {checkpoint_path}')
-    print(f'device: {device}')
+    ckpt_dir = os.path.join(output_dir, 'checkpoints')
+    samples_dir = os.path.join(output_dir, 'samples')
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(samples_dir, exist_ok=True)
 
-    # 训练flow matching模型
+    log_file_path = os.path.join(output_dir, 'train_reflow.log')
+    logger = DualLogger(log_file_path)
+    old_stdout = sys.stdout
+    sys.stdout = logger
 
-    # 数据集加载
-    transform = Compose([ToTensor()])  # 变换成tensor + 变为[0, 1]
+    with open(os.path.join(output_dir, 'config.yaml'), 'w', encoding='utf-8') as f:
+        yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
 
-    print(f'Loading dataset from {img_root_path} and {noise_root_path}...')
-    dataset = ReflowDataset(img_root_path=img_root_path,
-                            noise_root_path=noise_root_path,
-                            transform=transform)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    try:
+        print('=' * 60)
+        print('Reflow Training Started')
+        print(f'Start Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+        print(f'Output Directory: {os.path.abspath(output_dir)}')
+        print(f'Training Config:')
+        print(f'  base_channels: {base_channels}')
+        print(f'  epochs: {epochs}')
+        print(f'  batch_size: {batch_size}')
+        print(f'  lr: {lr}')
+        print(f'  checkpoint_path: {checkpoint_path}')
+        print(f'  device: {device}')
+        print('=' * 60)
 
-    print(f'Dataset Loaded: {len(dataset)} samples')
+        transform = Compose([ToTensor()])
+        dataset = ReflowDataset(img_root_path=img_root_path, noise_root_path=noise_root_path, transform=transform)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        print(f'Dataset Loaded: {len(dataset)} samples')
 
-    # 模型加载
-    model = MiniUnet(base_channels)
-    model.to(device)
+        model = MiniUnet(base_channels)
+        model.to(device)
 
-    # v1.2 reflow增加预训练权重加载 1-RF
-    print(f'Loading checkpoint from {checkpoint_path}...')
-    model.load_state_dict(torch.load(checkpoint_path)['model'])
-    print('Checkpoint loaded.')
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            print(f'Loading pretrained 1-RF checkpoint from {checkpoint_path}...')
+            ckpt_data = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(ckpt_data['model'])
+            print('Checkpoint successfully loaded.')
+        else:
+            print(f'[Warning] Checkpoint path not found: {checkpoint_path}')
 
-    # 优化器加载 Rectified Flow的论文里面有的用的就是AdamW
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.1)
+        optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.1)
+        scheduler = StepLR(optimizer, step_size=lr_adjust_epoch, gamma=0.1)
+        rf = RectifiedFlow()
 
-    # 学习率调整
-    scheduler = StepLR(optimizer, step_size=lr_adjust_epoch, gamma=0.1)
+        num_sample_imgs = (10 * sample_num_per_class) if use_cfg else 64
+        fixed_noise = torch.randn(
+            num_sample_imgs, 1, 28, 28,
+            generator=torch.Generator().manual_seed(42)
+        )
 
-    # RF加载
-    rf = RectifiedFlow()
+        loss_list = []
+        epoch_loss_list = []
 
-    # 记录训练时候每一轮的loss
-    loss_list = []
+        for epoch in range(1, epochs + 1):
+            epoch_loss = 0.0
+            batch_count = 0
 
-    # 模型权重保存路径文件夹提前创建
-    os.makedirs(save_path, exist_ok=True)
+            for batch, data in enumerate(dataloader):
+                x_1 = data['img']
+                x_0 = data['noise']
+                y = data['label']
 
-    # 训练循环
-    for epoch in range(epochs):
-        for batch, data in enumerate(dataloader):
+                t = torch.rand(x_1.size(0))
+                x_t, _ = rf.create_flow(x_1, t, x_0)
 
-            # reflow的数据集有三个输出，x_1是原始图像，y是标签
-            x_1 = data['img']
-            x_0 = data['noise']
-            y = data['label']
+                x_t = x_t.to(device)
+                x_0 = x_0.to(device)
+                x_1 = x_1.to(device)
+                t = t.to(device)
 
-            # 均匀采样[0, 1]的时间t randn 标准正态分布
-            t = torch.rand(x_1.size(0))
+                optimizer.zero_grad()
 
-            # 生成flow（实际上是一个点）
-            x_t, _ = rf.create_flow(x_1, t, x_0)
+                if use_cfg:
+                    x_t = torch.cat([x_t, x_t.clone()], dim=0)
+                    t = torch.cat([t, t.clone()], dim=0)
+                    y = torch.cat([y, -torch.ones_like(y)], dim=0)
+                    x_1 = torch.cat([x_1, x_1.clone()], dim=0)
+                    x_0 = torch.cat([x_0, x_0.clone()], dim=0)
+                    y = y.to(device)
+                else:
+                    y = None
 
-            # 4090 大概占用显存3G
-            x_t = x_t.to(device)
-            x_0 = x_0.to(device)
-            x_1 = x_1.to(device)
-            t = t.to(device)
+                v_pred = model(x=x_t, t=t, y=y)
+                loss = rf.mse_loss(v_pred, x_1, x_0)
+                loss.backward()
+                optimizer.step()
 
-            optimizer.zero_grad()
+                loss_val = loss.item()
+                loss_list.append(loss_val)
+                epoch_loss += loss_val
+                batch_count += 1
 
-            # 这里我们要做一个数据的复制和拼接，复制原始x_1，把一半的y替换成-1表示无条件生成，这里也可以直接有条件、无条件累计两次计算两次loss的梯度
-            # 一定的概率，把有条件生成换为无条件的 50%的概率 [x_t, x_t] [t, t]
-            if use_cfg:
-                x_t = torch.cat([x_t, x_t.clone()], dim=0)
-                t = torch.cat([t, t.clone()], dim=0)
-                y = torch.cat([y, -torch.ones_like(y)], dim=0)
-                x_1 = torch.cat([x_1, x_1.clone()], dim=0)
-                x_0 = torch.cat([x_0, x_0.clone()], dim=0)
-                y = y.to(device)
-            else:
-                y = None
+                if batch % batch_print_interval == 0:
+                    print(f'[Epoch {epoch}/{epochs}] [Batch {batch}/{len(dataloader)}] loss: {loss_val:.6f}')
 
-            v_pred = model(x=x_t, t=t, y=y)
+            scheduler.step()
+            avg_epoch_loss = epoch_loss / max(1, batch_count)
+            epoch_loss_list.append(avg_epoch_loss)
 
-            loss = rf.mse_loss(v_pred, x_1, x_0)
+            if epoch % checkpoint_save_interval == 0 or epoch == epochs:
+                save_dict = dict(
+                    model=model.state_dict(),
+                    optimizer=optimizer.state_dict(),
+                    epoch=epoch,
+                    loss_list=loss_list,
+                    epoch_loss_list=epoch_loss_list,
+                    config=cfg
+                )
+                ckpt_file = os.path.join(ckpt_dir, f'miniunet_{epoch}.pth')
+                torch.save(save_dict, ckpt_file)
 
-            loss.backward()
-            optimizer.step()
+                loss_curve_file = os.path.join(output_dir, 'loss_curve.png')
+                plot_and_save_loss_curve(loss_list, loss_curve_file, epoch=epoch)
 
-            if batch % batch_print_interval == 0:
-                print(f'[Epoch {epoch}] [batch {batch}] loss: {loss.item()}')
+                with open(os.path.join(output_dir, 'loss_history.json'), 'w', encoding='utf-8') as f:
+                    json.dump({'loss_list': loss_list, 'epoch_loss_list': epoch_loss_list}, f)
 
-            loss_list.append(loss.item())
+                sample_checkpoint_images(
+                    model=model,
+                    rf=rf,
+                    device=device,
+                    save_dir=samples_dir,
+                    epoch=epoch,
+                    use_cfg=use_cfg,
+                    cfg_scale=sample_cfg_scale,
+                    step=sample_steps,
+                    fixed_noise=fixed_noise,
+                    num_per_class=sample_num_per_class
+                )
 
-        scheduler.step()
+        torch.save(save_dict, os.path.join(ckpt_dir, 'miniunet_final.pth'))
+        plot_and_save_loss_curve(loss_list, os.path.join(output_dir, 'loss_curve.png'))
+        print(f'Reflow training complete! Outputs saved to: {os.path.abspath(output_dir)}')
 
-        if epoch % checkpoint_save_interval == 0 or epoch == epochs - 1 or epoch == 0:
-            # 第一轮也保存一下，快速测试用，大家可以删除
-            # 保存模型
-            print(f'Saving model {epoch} to {save_path}...')
-            save_dict = dict(model=model.state_dict(),
-                             optimizer=optimizer.state_dict(),
-                             epoch=epoch,
-                             loss_list=loss_list)
-            torch.save(save_dict,
-                       os.path.join(save_path, f'miniunet_{epoch}.pth'))
+    finally:
+        sys.stdout = old_stdout
+        logger.close()
 
 
 if __name__ == '__main__':
-    train(config='./config/train_reflow_config.yaml')
+    parser = argparse.ArgumentParser(description='Train Reflow model with logging and sampling')
+    parser.add_argument('--config', type=str, default='./config/train_reflow_config.yaml', help='Config path')
+    parser.add_argument('--output_dir', type=str, default=None, help='Custom output directory')
+    args = parser.parse_args()
+
+    train(config_path=args.config, output_dir_override=args.output_dir)

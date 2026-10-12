@@ -3,6 +3,9 @@
 *.pth
 *.safetensors
 *.bin
+*.log
+*.err
 data/
 **/__pycache__/
 results/
+outputs/
