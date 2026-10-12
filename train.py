@@ -82,12 +82,14 @@ def sample_checkpoint_images(
     cfg_scale=5.0,
     step=20,
     fixed_noise=None,
-    num_per_class=10
+    num_per_class=1
 ):
-    """在每个 checkpoint 时采样生成实际图片并保存全景拼图与独立图片"""
+    """在每个 checkpoint 时采样生成实际图片并保存全景拼图与独立图片
+    默认 num_per_class=1，条件生成时 0~9 每个数字采样 1 张，共 10 张图片
+    """
     model.eval()
     if use_cfg:
-        # 条件生成：0-9 每个数字采样 num_per_class 张，总计 100 张
+        # 条件生成：0-9 每个数字采样 num_per_class 张（默认各1张，总计10张）
         y = torch.tensor(
             [i for i in range(10) for _ in range(num_per_class)],
             device=device,
@@ -96,10 +98,10 @@ def sample_checkpoint_images(
         num_imgs = 10 * num_per_class
         nrow = 10
     else:
-        # 无条件生成：采样 64 张
+        # 无条件生成：采样 10 张
         y = None
-        num_imgs = 64
-        nrow = 8
+        num_imgs = 10
+        nrow = 10
 
     if fixed_noise is not None and fixed_noise.shape[0] == num_imgs:
         x_t = fixed_noise.clone().to(device)
@@ -119,7 +121,7 @@ def sample_checkpoint_images(
 
     x_t = x_t.clamp(0, 1)
 
-    # 1. 保存全景拼图 grid
+    # 1. 保存全景拼图 grid (1行10列)
     grid_file = os.path.join(save_dir, f'epoch_{epoch:03d}_grid.png')
     save_image(x_t, grid_file, nrow=nrow)
 
@@ -128,19 +130,20 @@ def sample_checkpoint_images(
     os.makedirs(indiv_dir, exist_ok=True)
     for idx in range(num_imgs):
         label_str = f"_label_{y[idx].item()}" if y is not None else ""
-        save_image(x_t[idx], os.path.join(indiv_dir, f'{idx:03d}{label_str}.png'))
+        save_image(x_t[idx], os.path.join(indiv_dir, f'{idx:02d}{label_str}.png'))
 
     model.train()
-    print(f'  [Checkpoint {epoch}] 采样完成，图像总览已保存至: {grid_file}')
+    print(f'  [Checkpoint {epoch}] 采样完成（共 {num_imgs} 张），拼图已保存至: {grid_file}')
     return grid_file
 
 
-def train(config_path: str = './config/train_config.yaml', output_dir_override: str = None):
+def train(config_path: str = './config/train_config.yaml', output_dir_override: str = None, wandb_override: bool = None):
     """训练 flow matching (rectified flow) 模型，并统一输出到时间戳目录
 
     Args:
         config_path (str): yaml配置文件路径
         output_dir_override (str, optional): 自定义输出目录，若为 None 则自动创建 outputs/<timestamp>
+        wandb_override (bool, optional): 显式开启或关闭 wandb 上传
     """
     # 读取yaml配置文件
     with open(config_path, 'r', encoding='utf-8') as f:
@@ -157,17 +160,24 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
     device = cfg.get('device', 'cuda')
     sample_steps = cfg.get('sample_steps', 20)
     sample_cfg_scale = cfg.get('sample_cfg_scale', 5.0)
-    sample_num_per_class = cfg.get('sample_num_per_class', 10)
+    sample_num_per_class = cfg.get('sample_num_per_class', 1)  # 默认每个数字采样1张，共10张
+
+    # 是否启用 wandb
+    use_wandb = cfg.get('use_wandb', False)
+    if wandb_override is not None:
+        use_wandb = wandb_override
+    wandb_project = cfg.get('wandb_project', 'rectified-flow')
+    wandb_run_name = cfg.get('wandb_run_name', None)
 
     if device == 'cuda' and not torch.cuda.is_available():
         print('[Warning] CUDA requested but not available on this node. Falling back to cpu.')
         device = 'cpu'
 
     # 创建 outputs 下带时间戳的文件夹
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     if output_dir_override:
         output_dir = output_dir_override
     else:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         outputs_root = cfg.get('outputs_root', './outputs')
         output_dir = os.path.join(outputs_root, timestamp)
 
@@ -185,6 +195,24 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
     # 保存本次训练的 config 副本，方便回溯复现
     with open(os.path.join(output_dir, 'config.yaml'), 'w', encoding='utf-8') as f:
         yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+
+    # 初始化 wandb
+    wandb_run = None
+    if use_wandb:
+        try:
+            import wandb
+            run_name = wandb_run_name or f"rf-{timestamp}"
+            wandb_run = wandb.init(
+                project=wandb_project,
+                name=run_name,
+                config=cfg,
+                dir=output_dir
+            )
+            print(f'W&B logging enabled! Run URL: {wandb_run.url}')
+        except Exception as e:
+            print(f'[Warning] Failed to initialize wandb ({e}). Continuing without wandb.')
+            use_wandb = False
+            wandb_run = None
 
     try:
         print('=' * 60)
@@ -204,6 +232,8 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
         print(f'  device: {device}')
         print(f'  sample_steps: {sample_steps}')
         print(f'  sample_cfg_scale: {sample_cfg_scale}')
+        print(f'  sample_num_per_class: {sample_num_per_class} (Total {10 * sample_num_per_class if use_cfg else 10} images)')
+        print(f'  use_wandb: {use_wandb}')
         print('=' * 60)
 
         # 数据集加载
@@ -224,7 +254,7 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
         rf = RectifiedFlow()
 
         # 固定初始高斯噪声，方便在不同 checkpoint 之间直观对比同一噪声生成质量的变化
-        num_sample_imgs = (10 * sample_num_per_class) if use_cfg else 64
+        num_sample_imgs = (10 * sample_num_per_class) if use_cfg else 10
         fixed_noise = torch.randn(
             num_sample_imgs, 1, 28, 28,
             generator=torch.Generator().manual_seed(42)
@@ -232,10 +262,11 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
 
         loss_list = []
         epoch_loss_list = []
+        global_step = 0
 
         # 训练前先采样一次未训练的初态（epoch 0 前）作为 baseline 对照
         print('\n--> 初始采样 (未经训练的模型初态)...')
-        sample_checkpoint_images(
+        init_grid = sample_checkpoint_images(
             model=model,
             rf=rf,
             device=device,
@@ -247,6 +278,9 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
             fixed_noise=fixed_noise,
             num_per_class=sample_num_per_class
         )
+        if use_wandb and wandb_run:
+            import wandb
+            wandb.log({'samples/grid': wandb.Image(init_grid, caption='Epoch 0 (Initial)'), 'epoch': 0, 'iteration': 0})
 
         # 训练主循环
         for epoch in range(1, epochs + 1):
@@ -287,6 +321,15 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
                 loss_list.append(loss_val)
                 epoch_loss += loss_val
                 batch_count += 1
+                global_step += 1
+
+                if use_wandb and wandb_run and (global_step % 10 == 0):
+                    import wandb
+                    wandb.log({
+                        'train/batch_loss': loss_val,
+                        'train/lr': scheduler.get_last_lr()[0],
+                        'iteration': global_step
+                    })
 
                 if batch % batch_print_interval == 0:
                     print(f'[Epoch {epoch}/{epochs}] [Batch {batch}/{len(dataloader)}] loss: {loss_val:.6f}')
@@ -295,6 +338,14 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
             avg_epoch_loss = epoch_loss / max(1, batch_count)
             epoch_loss_list.append(avg_epoch_loss)
             print(f'>>> [Epoch {epoch} finished] Average Loss: {avg_epoch_loss:.6f}')
+
+            if use_wandb and wandb_run:
+                import wandb
+                wandb.log({
+                    'train/epoch_loss': avg_epoch_loss,
+                    'epoch': epoch,
+                    'iteration': global_step
+                })
 
             # 达到保存间隔或最后一轮时保存模型、绘制曲线、采样图像
             if epoch % checkpoint_save_interval == 0 or epoch == epochs:
@@ -321,8 +372,8 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
                 with open(loss_json_file, 'w', encoding='utf-8') as f:
                     json.dump({'loss_list': loss_list, 'epoch_loss_list': epoch_loss_list}, f)
 
-                # 采样实际图片
-                sample_checkpoint_images(
+                # 采样实际图片 (10 张)
+                grid_file = sample_checkpoint_images(
                     model=model,
                     rf=rf,
                     device=device,
@@ -334,23 +385,54 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
                     fixed_noise=fixed_noise,
                     num_per_class=sample_num_per_class
                 )
+
+                if use_wandb and wandb_run:
+                    import wandb
+                    wandb.log({
+                        'samples/grid': wandb.Image(grid_file, caption=f"Epoch {epoch}"),
+                        'epoch': epoch,
+                        'iteration': global_step
+                    })
                 print()
 
         # 保存最终权重
         final_ckpt = os.path.join(ckpt_dir, 'miniunet_final.pth')
         torch.save(save_dict, final_ckpt)
+        loss_curve_file = os.path.join(output_dir, 'loss_curve.png')
+        plot_and_save_loss_curve(loss_list, loss_curve_file)
+
+        if use_wandb and wandb_run:
+            import wandb
+            if os.path.exists(loss_curve_file):
+                wandb.log({'charts/loss_curve': wandb.Image(loss_curve_file)})
+            wandb.finish()
+
         print(f'Final model saved to: {final_ckpt}')
         print(f'All outputs successfully saved to: {os.path.abspath(output_dir)}')
 
     finally:
         sys.stdout = old_stdout
         logger.close()
+        if use_wandb and wandb_run:
+            try:
+                import wandb
+                wandb.finish()
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Train Rectified Flow with auto logging and checkpoint sampling')
+    parser = argparse.ArgumentParser(description='Train Rectified Flow with auto logging, sampling and optional wandb')
     parser.add_argument('--config', type=str, default='./config/train_config.yaml', help='Path to config YAML file')
     parser.add_argument('--output_dir', type=str, default=None, help='Custom output directory (default: outputs/<timestamp>)')
+    parser.add_argument('--wandb', action='store_true', default=None, help='Enable Weights & Biases logging')
+    parser.add_argument('--no-wandb', action='store_true', help='Disable Weights & Biases logging')
     args = parser.parse_args()
 
-    train(config_path=args.config, output_dir_override=args.output_dir)
+    wandb_override = None
+    if args.wandb:
+        wandb_override = True
+    elif args.no_wandb:
+        wandb_override = False
+
+    train(config_path=args.config, output_dir_override=args.output_dir, wandb_override=wandb_override)

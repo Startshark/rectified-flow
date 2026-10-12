@@ -82,7 +82,7 @@ def sample_checkpoint_images(
     cfg_scale=5.0,
     step=2,
     fixed_noise=None,
-    num_per_class=10
+    num_per_class=1
 ):
     """Reflow 模型采样生成实际图片并保存全景拼图与独立图片（Reflow 2步即可生成高质量图像）"""
     model.eval()
@@ -96,8 +96,8 @@ def sample_checkpoint_images(
         nrow = 10
     else:
         y = None
-        num_imgs = 64
-        nrow = 8
+        num_imgs = 10
+        nrow = 10
 
     if fixed_noise is not None and fixed_noise.shape[0] == num_imgs:
         x_t = fixed_noise.clone().to(device)

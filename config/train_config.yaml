@@ -11,4 +11,9 @@ device: 'cuda' # cuda、cpu、mps(only macbook)
 # 采样评估参数（每个checkpoint自动采样）
 sample_steps: 20 # 采样生成图片的Euler迭代步数（10~20步速度极快且效果优秀）
 sample_cfg_scale: 5.0 # CFG采样引导系数
-sample_num_per_class: 10 # 每个数字类别的采样图片数量（总计10x10=100张拼图及独立图像）
+sample_num_per_class: 1 # 每个数字类别的采样图片数量（设为1即0~9各1张，每次checkpoint只采样10张）
+
+# Weights & Biases (W&B) 在线日志同步
+use_wandb: true # 是否自动上传至 wandb（改为 true 或运行时加 --wandb 参数开启）
+wandb_project: 'rectified-flow' # wandb 项目名
+wandb_run_name: null # 自定义运行名称（留空则自动按时间戳命名）
