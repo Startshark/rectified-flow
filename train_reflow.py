@@ -18,6 +18,7 @@ import yaml
 from datasets import ReflowDataset
 from model import MiniUnet
 from rectified_flow import RectifiedFlow
+from training_strategies import build_time_sampler, build_loss_fn, build_loss_weighter
 
 
 class DualLogger:
@@ -209,7 +210,16 @@ def train(config_path: str = './config/train_reflow_config.yaml', output_dir_ove
 
         optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.1)
         scheduler = StepLR(optimizer, step_size=lr_adjust_epoch, gamma=0.1)
-        rf = RectifiedFlow()
+
+        # RF 算法 + 训练策略
+        strategy_cfg = cfg.get('training_strategy', {})
+        time_sampler = build_time_sampler(strategy_cfg.get('time_sampler'))
+        loss_fn = build_loss_fn(strategy_cfg.get('loss_fn'))
+        loss_weighter = build_loss_weighter(strategy_cfg.get('loss_weighter'))
+        rf = RectifiedFlow(time_sampler=time_sampler, loss_fn=loss_fn, loss_weighter=loss_weighter)
+        print(f'  time_sampler:  {rf.time_sampler}')
+        print(f'  loss_fn:       {rf.loss_fn}')
+        print(f'  loss_weighter: {rf.loss_weighter}')
 
         num_sample_imgs = (10 * sample_num_per_class) if use_cfg else 64
         fixed_noise = torch.randn(
@@ -229,7 +239,7 @@ def train(config_path: str = './config/train_reflow_config.yaml', output_dir_ove
                 x_0 = data['noise']
                 y = data['label']
 
-                t = torch.rand(x_1.size(0))
+                t = rf.sample_t(x_1.size(0))
                 x_t, _ = rf.create_flow(x_1, t, x_0)
 
                 x_t = x_t.to(device)
@@ -250,7 +260,7 @@ def train(config_path: str = './config/train_reflow_config.yaml', output_dir_ove
                     y = None
 
                 v_pred = model(x=x_t, t=t, y=y)
-                loss = rf.mse_loss(v_pred, x_1, x_0)
+                loss = rf.compute_loss(v_pred, x_1, x_0, t)
                 loss.backward()
                 optimizer.step()
 

@@ -1,10 +1,39 @@
 import torch
 import torch.nn.functional as F
 
+from training_strategies import (
+    UniformTimeSampler, MSELoss, UniformWeighter,
+)
+
 # 老司机开车理论->三要素：路线、车、司机
 
 
 class RectifiedFlow:
+    def __init__(self, time_sampler=None, loss_fn=None, loss_weighter=None):
+        """初始化 RectifiedFlow
+
+        Args:
+            time_sampler: 时间采样策略，callable(batch_size, device) -> Tensor[B]
+            loss_fn:      损失函数策略，callable(pred, target) -> Tensor[B] (per-sample)
+            loss_weighter: 损失加权策略，callable(t) -> Tensor[B] (权重)
+        """
+        self.time_sampler = time_sampler or UniformTimeSampler()
+        self.loss_fn = loss_fn or MSELoss()
+        self.loss_weighter = loss_weighter or UniformWeighter()
+
+    # 采样时间 t
+    def sample_t(self, batch_size, device='cpu'):
+        """采样时间 t ∈ (ε, 1-ε)，避免边界数值问题
+
+        Args:
+            batch_size: 批次大小
+            device: 设备
+        Returns:
+            t: 采样的时间，维度为 [B]
+        """
+        t = self.time_sampler(batch_size, device)
+        return t.clamp(1e-5, 1 - 1e-5)
+
     # 车：图像生成一个迭代公式 ODE f(t+dt) = f(t) + dt*f'(t)
     def euler(self, x_t, v, dt):
         """ 使用欧拉方法计算下一个时间步长的值
@@ -52,9 +81,32 @@ class RectifiedFlow:
 
         return x_t, x_0
 
-    # 司机
+    # 司机：可插拔的损失计算
+    def compute_loss(self, v_pred, x_1, x_0, t):
+        """计算加权损失（支持自定义损失函数和加权策略）
+
+        Args:
+            v_pred: 模型预测的速度，维度为 [B, C, H, W]
+            x_1: 原始图像，维度为 [B, C, H, W]
+            x_0: 噪声图像，维度为 [B, C, H, W]
+            t: 采样时间，维度为 [B]
+        Returns:
+            loss: 标量损失值
+        """
+        target = x_1 - x_0  # flow matching target: velocity = x_1 - x_0
+
+        # 计算 per-sample loss [B]
+        per_sample_loss = self.loss_fn(v_pred, target)
+
+        # 计算 per-sample weight [B]
+        weights = self.loss_weighter(t)
+
+        # 加权平均
+        return (weights * per_sample_loss).mean()
+
+    # 保留原有 mse_loss 做向后兼容
     def mse_loss(self, v, x_1, x_0):
-        """ 计算RectifiedFlow的损失函数
+        """ 计算RectifiedFlow的损失函数（向后兼容）
         L = MSE(x_1 - x_0 - v(t))  匀速直线运动
 
         Args:

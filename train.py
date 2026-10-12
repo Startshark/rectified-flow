@@ -18,6 +18,7 @@ import yaml
 
 from model import MiniUnet
 from rectified_flow import RectifiedFlow
+from training_strategies import build_time_sampler, build_loss_fn, build_loss_weighter
 
 
 class DualLogger:
@@ -167,6 +168,7 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
     if wandb_override is not None:
         use_wandb = wandb_override
     wandb_project = cfg.get('wandb_project', 'rectified-flow')
+    wandb_entity = cfg.get('wandb_entity', None)
     wandb_run_name = cfg.get('wandb_run_name', None)
 
     if device == 'cuda' and not torch.cuda.is_available():
@@ -201,8 +203,22 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
     if use_wandb:
         try:
             import wandb
+            # 自动探测 entity，防止因属于高校/企业团队组织导致 entity not specified 错误
+            if not wandb_entity:
+                try:
+                    _api = wandb.Api()
+                    if getattr(_api.viewer, 'teams', None) and len(_api.viewer.teams) > 0:
+                        wandb_entity = _api.viewer.teams[0]
+                    elif _api.default_entity:
+                        wandb_entity = _api.default_entity
+                    else:
+                        wandb_entity = _api.viewer.username
+                except Exception:
+                    pass
+
             run_name = wandb_run_name or f"rf-{timestamp}"
             wandb_run = wandb.init(
+                entity=wandb_entity,
                 project=wandb_project,
                 name=run_name,
                 config=cfg,
@@ -250,8 +266,15 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
         optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=0.1)
         scheduler = StepLR(optimizer, step_size=lr_adjust_epoch, gamma=0.1)
 
-        # RF 算法
-        rf = RectifiedFlow()
+        # RF 算法 + 训练策略
+        strategy_cfg = cfg.get('training_strategy', {})
+        time_sampler = build_time_sampler(strategy_cfg.get('time_sampler'))
+        loss_fn = build_loss_fn(strategy_cfg.get('loss_fn'))
+        loss_weighter = build_loss_weighter(strategy_cfg.get('loss_weighter'))
+        rf = RectifiedFlow(time_sampler=time_sampler, loss_fn=loss_fn, loss_weighter=loss_weighter)
+        print(f'  time_sampler:  {rf.time_sampler}')
+        print(f'  loss_fn:       {rf.loss_fn}')
+        print(f'  loss_weighter: {rf.loss_weighter}')
 
         # 固定初始高斯噪声，方便在不同 checkpoint 之间直观对比同一噪声生成质量的变化
         num_sample_imgs = (10 * sample_num_per_class) if use_cfg else 10
@@ -289,7 +312,7 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
 
             for batch, data in enumerate(dataloader):
                 x_1, y = data  # x_1 原始图像，y 是标签
-                t = torch.rand(x_1.size(0))
+                t = rf.sample_t(x_1.size(0))
 
                 x_t, x_0 = rf.create_flow(x_1, t)
 
@@ -312,7 +335,7 @@ def train(config_path: str = './config/train_config.yaml', output_dir_override: 
                     y = None
 
                 v_pred = model(x=x_t, t=t, y=y)
-                loss = rf.mse_loss(v_pred, x_1, x_0)
+                loss = rf.compute_loss(v_pred, x_1, x_0, t)
 
                 loss.backward()
                 optimizer.step()

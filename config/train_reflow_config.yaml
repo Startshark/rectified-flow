@@ -13,3 +13,15 @@ device: 'cuda' # cuda、cpu、mps(only macbook)
 img_root_path: './data/reflow_img'  # 图像的地址
 noise_root_path: './data/reflow_noise'  # 噪声的地址
 checkpoint_path: './checkpoints/v1.1-cfg/miniunet_49.pth'  # 模型的地址 finetune
+
+# 训练策略配置（全部可选，不写则使用默认值）
+training_strategy:
+  time_sampler:
+    name: 'logit_normal'           # uniform | logit_normal | beta | cosine | stratified
+    params:                 # logit_normal: {loc: 0.0, scale: 1.0}
+      loc: 0.0
+      scale: 1.0
+  loss_fn:
+    name: 'mse'               # mse | huber | pseudo_huber | charbonnier | l1
+  loss_weighter:
+    name: 'uniform'           # uniform | snr | cosine | linear | inverse | lognormal

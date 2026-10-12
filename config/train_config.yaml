@@ -16,4 +16,20 @@ sample_num_per_class: 1 # 每个数字类别的采样图片数量（设为1即0~
 # Weights & Biases (W&B) 在线日志同步
 use_wandb: true # 是否自动上传至 wandb（改为 true 或运行时加 --wandb 参数开启）
 wandb_project: 'rectified-flow' # wandb 项目名
+wandb_entity: 'ruh_cmu-carnegie-mellon-university' # wandb 组织/团队名（CMU）
 wandb_run_name: null # 自定义运行名称（留空则自动按时间戳命名）
+
+# 训练策略配置（全部可选，不写则使用默认值）
+# 可选值见 training_strategies.py 中的 Registry
+training_strategy:
+  time_sampler:
+    name: 'logit_normal'           # uniform | logit_normal | beta | cosine | stratified
+    params:                 # logit_normal: {loc: 0.0, scale: 1.0}
+      loc: 0.0
+      scale: 1.0
+  loss_fn:
+    name: 'mse'               # mse | huber | pseudo_huber | charbonnier | l1
+    # params:                 # huber: {delta: 1.0}, pseudo_huber: {c: 0.00054}
+  loss_weighter:
+    name: 'uniform'           # uniform | snr | cosine | linear | inverse | lognormal
+    # params:                 # snr: {gamma: 5.0}, lognormal: {loc: 0.0, scale: 1.0}
