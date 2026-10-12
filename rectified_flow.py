@@ -40,6 +40,11 @@ class RectifiedFlow:
         if x_0 is None:
             x_0 = torch.randn_like(x_1)
 
+        if not isinstance(t, torch.Tensor):
+            t = torch.tensor(t, dtype=x_1.dtype, device=x_1.device)
+        if t.ndim == 0:
+            t = t.unsqueeze(0)
+
         t = t[:, None, None, None]  # [B, 1, 1, 1]
 
         # 获得xt的值

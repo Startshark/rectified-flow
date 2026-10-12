@@ -29,6 +29,10 @@ def infer(
         save_noise_path (str, optional): 保存噪声路径，默认值为None。
         device (str, optional): 推理设备，默认值为'cuda'。
     """
+    if device == 'cuda' and not torch.cuda.is_available():
+        print('[Warning] CUDA requested but not available on this node. Falling back to cpu.')
+        device = 'cpu'
+
     os.makedirs(save_path, exist_ok=True)
     if save_noise_path is not None:
         os.makedirs(save_noise_path, exist_ok=True)
@@ -111,21 +115,29 @@ if __name__ == '__main__':
     for i in range(10):
         y.extend([i] * 10)
     # v1.1 1-RF
-    infer(checkpoint_path='./checkpoints/v1.1-cfg/miniunet_49.pth',
-          base_channels=64,
-          step=2,
-          num_imgs=100,
-          y=torch.tensor(y),
-          cfg_scale=5.0,
-          save_path='./results/cfg',
-          device='cuda')
+    ckpt_v1_1 = './checkpoints/v1.1-cfg/miniunet_49.pth'
+    if os.path.exists(ckpt_v1_1):
+        print(f"Running inference using {ckpt_v1_1} (step=10)...")
+        infer(checkpoint_path=ckpt_v1_1,
+              base_channels=64,
+              step=10,
+              num_imgs=100,
+              y=torch.tensor(y),
+              cfg_scale=5.0,
+              save_path='./results/cfg',
+              device='cuda')
+    else:
+        print(f"Checkpoint not found: {ckpt_v1_1}")
 
-    # v1.2 2-RF
-    infer(checkpoint_path='./checkpoints/v1.2-reflow-cfg/miniunet_19.pth',
-          base_channels=64,
-          step=2,
-          num_imgs=100,
-          y=torch.tensor(y),
-          cfg_scale=5.0,
-          save_path='./results/reflow-cfg',
-          device='cuda')
+    # v1.2 2-RF (如果存在则测试)
+    ckpt_v1_2 = './checkpoints/v1.2-reflow-cfg/miniunet_19.pth'
+    if os.path.exists(ckpt_v1_2):
+        print(f"Running inference using {ckpt_v1_2}...")
+        infer(checkpoint_path=ckpt_v1_2,
+              base_channels=64,
+              step=2,
+              num_imgs=100,
+              y=torch.tensor(y),
+              cfg_scale=5.0,
+              save_path='./results/reflow-cfg',
+              device='cuda')

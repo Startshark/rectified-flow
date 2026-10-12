@@ -335,7 +335,7 @@ class MiniUnet(nn.Module):
 
 
 if __name__ == '__main__':
-    device = 'mps'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = MiniUnet()
     model = model.to(device)
     x = torch.randn(2, 1, 28, 28).to(device)

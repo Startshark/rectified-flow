@@ -44,6 +44,9 @@ def train(config: str):
     save_path = config.get('save_path', './checkpoints')
     use_cfg = config.get('use_cfg', False)
     device = config.get('device', 'cuda')
+    if device == 'cuda' and not torch.cuda.is_available():
+        print('[Warning] CUDA requested but not available on this node. Falling back to cpu.')
+        device = 'cpu'
 
     # v1.2 reflow增加参数
     lr = config.get('lr', 1e-5)
